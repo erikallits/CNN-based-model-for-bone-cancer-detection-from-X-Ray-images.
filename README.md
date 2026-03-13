@@ -16,6 +16,5 @@ xray-ai-project/
         valid/
         test/
     main.py            # Training and evaluation script
-    requirements.txt   # Python dependencies
     README.md          # Project overview
 ```
