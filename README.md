@@ -1,4 +1,4 @@
-# XRay
+# README
 
 **CNN-based model for bone cancer detection from X-Ray images.**  
 
