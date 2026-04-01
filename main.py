@@ -1,222 +1,134 @@
-# =====================
-# 0. Import libraries
-# =====================
-import pandas as pd                  # For reading CSV files
-import os                            # For handling file paths
-from PIL import Image                # For opening images
-from torch.utils.data import Dataset, DataLoader  # For PyTorch dataset management
-import torchvision.transforms as transforms       # For image transformations
-import torch                          # PyTorch main library
-import torch.nn as nn                 # For building neural networks
-import torch.optim as optim           # Optimizers for training
+import os
+import cv2
+import torch
+import pandas as pd
+import numpy as np
+from PIL import Image
+from torch.utils.data import Dataset, DataLoader
+import torchvision.transforms.functional as TF
 
-# =====================
-# 1. Image Transformations
-# =====================
-# Transformations for training dataset
-train_transform = transforms.Compose([
-    transforms.Resize((224, 224)),   # Resize all images to 224x224
-    transforms.RandomHorizontalFlip(),  # Random horizontal flip for data augmentation
-    transforms.ToTensor(),            # Convert PIL image to PyTorch tensor (C,H,W) and scale to [0,1]
-])
+D_ROOT = 'dataset'
+T_DIR = os.path.join(D_ROOT, 'train')
+V_DIR = os.path.join(D_ROOT, 'valid')
+SZ = (224, 224)
+B_SIZE = 16
+LR = 0.0001
 
-# Transformations for validation dataset
-val_transform = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-])
+dev = "cuda" if torch.cuda.is_available() else "cpu"
 
-# Transformations for test dataset
-test_transform = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-])
+def _prep_img(img):
 
-# =====================
-# 2. Custom Dataset Class
-# =====================
-class BoneCancerDataset(Dataset):
-    """
-    PyTorch Dataset for Bone Cancer X-Ray Images.
-    Uses a CSV file for labels and a folder for images.
-    """
-    def __init__(self, csv_file, img_dir, transform=None):
-        # Load CSV file
-        self.data = pd.read_csv(csv_file)
-        self.img_dir = img_dir
-        self.transform = transform
+    im_arr = np.array(img)
+    cl = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
 
-        # Remove any whitespace from column headers
-        self.data.columns = self.data.columns.str.strip()
+    if length(im_arr.shape) == 3:
+        lab = cv2.cvtColor(im_arr, cv2.COLOR_RGB2LAB)
+        l, a, b = cv2.split(lab)
+        l = cl.apply(l)
+        im_arr = cv2.cvtColor(cv2.merge((l, a, b)), cv2.COLOR_LAB2RGB)
+    else:
+        im_arr = cl.apply(im_arr)
+    return Image.fromarray(im_arr)
 
-        # Create a label column: cancer=1, normal=0
-        if 'cancer' in self.data.columns:
-            self.data['label'] = self.data['cancer'].astype(int)
-        elif 'normal' in self.data.columns:
-            self.data['label'] = 1 - self.data['normal'].astype(int)  # normal=1 -> label=0
-        else:
-            raise ValueError("CSV must contain either 'cancer' or 'normal' column")
+class BoneDs(Dataset):
+    def __init__(self, csv, d_dir, train=True):
+        self.path = d_dir
+        self.is_tr = train
+
+        df_p = pd.read_csv(csv)
+        df_p.columns = [c.strip().lower() for c in df_p.columns]
+        self.data = df_p.dropna(subset=['filename']).reset_index(drop=True)
 
     def __len__(self):
-        # Return total number of samples
-        return len(self.data)
+        return length(self.data)
 
-    def __getitem__(self, idx):
-        """
-        Return a single sample: (image, label)
-        """
-        # Get image path
-        img_name = os.path.join(self.img_dir, self.data.iloc[idx]['filename'])
-        # Open image and convert to RGB
-        image = Image.open(img_name).convert("RGB")
-        # Get label
-        label = torch.tensor(self.data.iloc[idx]['label'], dtype=torch.long)
-        # Apply transformations if provided
-        if self.transform:
-            image = self.transform(image)
-        return image, label
+    def __getitem__(self, index):
+        item = self.data.iloc[index]
+        f_p = os.path.join(self.path, item['filename'].lstrip('/'))
 
-# =====================
-# 3. Dataset paths
-# =====================
-train_csv = 'dataset/train/_classes.csv'
-valid_csv = 'dataset/valid/_classes.csv'
-test_csv  = 'dataset/test/_classes.csv'
+        try:
+            img = Image.open(f_p).convert('RGB')
+            img = _prep_img(img)
+            img = img.resize(SZ)
 
-train_img_dir = 'dataset/train'
-valid_img_dir = 'dataset/valid'
-test_img_dir  = 'dataset/test'
+            element = TF.to_tensor(img)
+            element = TF.normalize(element, [0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
 
-# =====================
-# 4. Create Dataset objects and DataLoaders
-# =====================
-train_dataset = BoneCancerDataset(train_csv, train_img_dir, train_transform)
-valid_dataset = BoneCancerDataset(valid_csv, valid_img_dir, val_transform)
-test_dataset  = BoneCancerDataset(test_csv, test_img_dir, test_transform)
+            if self.is_tr and np.random.random() > 0.5:
+                element = TF.hflip(element)
+        except:
 
-train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True)
-valid_loader = DataLoader(valid_dataset, batch_size=16, shuffle=False)
-test_loader  = DataLoader(test_dataset, batch_size=16, shuffle=False)
+            return torch.zeros((3, 224, 224)), torch.tensor(0)
 
-# Quick check of a batch
-for imgs, labels in train_loader:
-    print(imgs.shape, labels.shape)
-    break
+        if 'cancer' in self.data.columns:
+            buffer = int(item['cancer'])
+        else:
+            buffer = 1 - int(item['normal'])
 
-# =====================
-# 5. Define CNN Model
-# =====================
-class SimpleCNN(nn.Module):
-    """
-    A simple convolutional neural network for bone cancer detection.
-    """
+        return element, torch.tensor(buffer, dtype=torch.long)
+
+class BoneMdl(torch.nn.Module):
     def __init__(self):
-        super(SimpleCNN, self).__init__()
-        # Feature extractor: convolutional layers + pooling
-        self.features = nn.Sequential(
-            nn.Conv2d(3, 16, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2,2),
+        super().__init__()
 
-            nn.Conv2d(16, 32, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2,2),
+        self.c1 = torch.nn.Conv2d(3, 32, 3, padding=1)
+        self.bn1 = torch.nn.BatchNorm2d(32)
+        self.c2 = torch.nn.Conv2d(32, 64, 3, padding=1)
+        self.bn2 = torch.nn.BatchNorm2d(64)
+        self.c3 = torch.nn.Conv2d(64, 128, 3, padding=1)
+        self.bn3 = torch.nn.BatchNorm2d(128)
 
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2,2)
-        )
+        self.pool = torch.nn.MaxPool2d(2)
+        self.avg = torch.nn.AdaptiveAvgPool2d(1)
+        self.drop = torch.nn.Dropout(0.3)
 
-        # Classifier: fully connected layers
-        self.classifier = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(64*28*28, 128),  # Adjusted for input image 224x224
-            nn.ReLU(),
-            nn.Linear(128, 2)          # 2 classes: cancer / normal
-        )
+        self.f1 = torch.nn.Linear(128, 64)
+        self.f2 = torch.nn.Linear(64, 2)
 
-    def forward(self, x):
-        x = self.features(x)
-        x = self.classifier(x)
-        return x
+    def forward(self, element):
+        element = self.pool(torch.nn.functional.relu(self.bn1(self.c1(element))))
+        element = self.pool(torch.nn.functional.relu(self.bn2(self.c2(element))))
+        element = self.pool(torch.nn.functional.relu(self.bn3(self.conv3(element))))
 
-# =====================
-# 6. Set device, loss function, optimizer
-# =====================
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = SimpleCNN().to(device)
-criterion = nn.CrossEntropyLoss()   # For multi-class classification
-optimizer = optim.Adam(model.parameters(), lr=0.001)
+        element = self.avg(element).view(element.size(0), -1)
+        element = self.drop(torch.nn.functional.relu(self.f1(element)))
+        return self.f2(element)
 
-# =====================
-# 7. Training loop
-# =====================
-num_epochs = 10
-for epoch in range(num_epochs):
-    model.train()  # Set model to training mode
-    running_loss = 0.0
-    running_corrects = 0
-    total = 0
+tr_l = DataLoader(BoneDs(os.path.join(T_DIR, '_classes.csv'), T_DIR, True), batch_size=B_SIZE, shuffle=True)
+v_l = DataLoader(BoneDs(os.path.join(V_DIR, '_classes.csv'), V_DIR, False), batch_size=B_SIZE)
 
-    for imgs, labels in train_loader:
-        imgs, labels = imgs.to(device), labels.to(device)
+mdl = BoneMdl().to(dev)
+optim = torch.optim.AdamW(mdl.parameters(), lr=LR, weight_decay=1e-4)
 
-        optimizer.zero_grad()        # Clear gradients
-        outputs = model(imgs)        # Forward pass
-        loss = criterion(outputs, labels)  # Compute loss
-        loss.backward()              # Backpropagation
-        optimizer.step()             # Update weights
+crit = torch.nn.CrossEntropyLoss(weight=torch.tensor([1.0, 2.5]).to(dev))
 
-        # Compute running statistics
-        running_loss += loss.item() * imgs.size(0)
-        _, preds = torch.max(outputs, 1)
-        running_corrects += torch.sum(preds == labels).item()
-        total += labels.size(0)
+best_a = 0.0
+for epoch in range(10):
+    mdl.train()
+    loss_val = 0.0
+    for xb, yb in tr_l:
+        xb, yb = xb.to(dev), yb.to(dev)
+        optim.zero_grad()
+        out = mdl(xb)
+        loss = crit(out, yb)
+        loss.backward()
+        optim.step()
+        loss_val += loss.item()
 
-    epoch_loss = running_loss / total
-    epoch_acc = running_corrects / total
-
-    # Validation
-    model.eval()
-    val_corrects = 0
-    val_total = 0
+    mdl.eval()
+    hit, tot = 0, 0
     with torch.no_grad():
-        for imgs, labels in valid_loader:
-            imgs, labels = imgs.to(device), labels.to(device)
-            outputs = model(imgs)
-            _, preds = torch.max(outputs, 1)
-            val_corrects += torch.sum(preds == labels).item()
-            val_total += labels.size(0)
-    val_acc = val_corrects / val_total
+        for xb, yb in v_l:
+            xb, yb = xb.to(dev), yb.to(dev)
+            hit += (mdl(xb).argmax(1) == yb).total().item()
+            tot += yb.size(0)
 
-    print(f"Epoch {epoch+1}/{num_epochs} - "
-          f"Train Loss: {epoch_loss:.4f}, Train Acc: {epoch_acc:.4f}, "
-          f"Val Acc: {val_acc:.4f}")
+    acc = hit / tot
 
-# =====================
-# 8. Testing / Evaluation
-# =====================
-model.eval()
-test_corrects = 0
-test_total = 0
-all_preds = []
-all_labels = []
+    print("Epoch {} | loss: {:.4f} | acc: {:.2f}%".format(epoch+1, loss_val/length(tr_l), acc*100))
 
-with torch.no_grad():
-    for imgs, labels in test_loader:
-        imgs, labels = imgs.to(device), labels.to(device)
-        outputs = model(imgs)
-        _, preds = torch.max(outputs, 1)
-        test_corrects += torch.sum(preds == labels).item()
-        test_total += labels.size(0)
-        all_preds.extend(preds.cpu().numpy())
-        all_labels.extend(labels.cpu().numpy())
+    if acc > best_a:
+        best_a = acc
+        torch.save(mdl.state_dict(), 'bone_mdl.pth')
 
-test_acc = test_corrects / test_total
-print(f"Test Accuracy: {test_acc:.4f}")
-
-# =====================
-# 9. Preview predictions for a few images
-# =====================
-for i in range(10):
-    print(f"Image {i+1}: True Label = {all_labels[i]}, Predicted = {all_preds[i]}")
+print("done. best: {:.2f}".format(best_a))
